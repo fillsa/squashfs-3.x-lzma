@@ -1,28 +1,50 @@
+
+ifndef Sqlzma
+$(error Sqlzma is not defined)
+endif
+
 INSTALL_DIR = /usr/local/bin
 
 INCLUDEDIR = .
 
 CFLAGS := -I$(INCLUDEDIR) -D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE -D_GNU_SOURCE -O2
 
-all: mksquashfs unsquashfs
+ifdef UseDebugFlags
+DebugFlags = -g -Wall -Wno-unused-variable -O0 -UNDEBUG
+endif
+CFLAGS += -I${Sqlzma} -D_REENTRANT -DNDEBUG ${DebugFlags}
+LDLIBS += -lz -lm -L${LzmaAlone} -L${LzmaC}
+Tgt = mksquashfs unsquashfs
 
-mksquashfs: mksquashfs.o read_fs.o sort.o
-	$(CC) mksquashfs.o read_fs.o sort.o -lz -lpthread -lm -o $@
+all: ${Tgt}
 
-mksquashfs.o: mksquashfs.c squashfs_fs.h mksquashfs.h global.h sort.h
-
-read_fs.o: read_fs.c squashfs_fs.h read_fs.h global.h
+read_fs.o: read_fs.c squashfs_fs.h read_fs.h global.h \
+	${Sqlzma}/sqlzma.h ${Sqlzma}/sqmagic.h
 
 sort.o: sort.c squashfs_fs.h global.h sort.h
 
-unsquashfs: unsquashfs.o
-	$(CC) unsquashfs.o -lz -lpthread -lm -o $@
+mksquashfs.o: mksquashfs.c squashfs_fs.h mksquashfs.h global.h sort.h \
+	${Sqlzma}/sqlzma.h ${Sqlzma}/sqmagic.h \
+	${LzmaAlone}/liblzma_r.a ${LzmaC}/libunlzma_r.a
+mksquashfs: LDLIBS += -lpthread -lunlzma_r -llzma_r -lstdc++
+mksquashfs: mksquashfs.o read_fs.o sort.o
 
-unsquashfs.o: unsquashfs.c squashfs_fs.h read_fs.h global.h
+unsquashfs.o: CFLAGS += -U_REENTRANT
+unsquashfs.o: unsquashfs.c squashfs_fs.h read_fs.h global.h \
+	${Sqlzma}/sqlzma.h ${Sqlzma}/sqmagic.h ${LzmaC}/libunlzma.a
+unsquashfs: LDLIBS += -lpthread -lunlzma -lz
+unsquashfs: unsquashfs.o
 
 clean:
-	-rm -f *.o mksquashfs unsquashfs
+	${RM} *~ *.o ${Tgt}
+
+-include test.mk
+
 
 install: mksquashfs unsquashfs
 	mkdir -p $(INSTALL_DIR)
 	cp mksquashfs unsquashfs $(INSTALL_DIR)
+
+# Local variables: ;
+# compile-command: (concat "make Sqlzma=../.. -f " (file-name-nondirectory (buffer-file-name)));
+# End: ;

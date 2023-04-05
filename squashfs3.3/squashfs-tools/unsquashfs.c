@@ -28,6 +28,7 @@
 #define FALSE 0
 #include <stdio.h>
 #include <sys/types.h>
+#include <unistd.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -40,6 +41,7 @@
 #include <time.h>
 #include <regex.h>
 #include <fnmatch.h>
+#include <sys/sysmacros.h>
 
 #ifndef linux
 #define __BYTE_ORDER BYTE_ORDER
@@ -52,6 +54,8 @@
 #include <squashfs_fs.h>
 #include "read_fs.h"
 #include "global.h"
+#include "sqlzma.h"
+#include "sqmagic.h"
 
 #include <stdlib.h>
 #include <time.h>
@@ -83,7 +87,7 @@ typedef struct squashfs_operations {
 	struct dir *(*squashfs_opendir)(char *pathname, unsigned int block_start, unsigned int offset);
 	char *(*read_fragment)(unsigned int fragment);
 	void (*read_fragment_table)();
-	void (*read_block_list)(unsigned int *block_list, unsigned char *block_ptr, int blocks);
+	void (*read_block_list)(unsigned int *block_list, char *block_ptr, int blocks);
 	struct inode *(*read_inode)(unsigned int start_block, unsigned int offset);
 } squashfs_operations;
 
@@ -131,6 +135,7 @@ unsigned int block_size;
 int lsonly = FALSE, info = FALSE, force = FALSE, short_ls = TRUE, use_regex = FALSE;
 char **created_inode;
 int root_process;
+struct sqlzma_un un;
 
 int lookup_type[] = {
 	0,
@@ -198,6 +203,8 @@ int print_filename(char *pathname, struct inode *inode)
 		printf("%s\n", pathname);
 		return 1;
 	}
+
+	/* printf("i%d ", inode->inode_number); */
 
 	if((user = getpwuid(inode->uid)) == NULL) {
 		sprintf(dummy, "%d", inode->uid);
@@ -318,21 +325,21 @@ int read_block(long long start, long long *next, char *block)
 		char buffer[SQUASHFS_METADATA_SIZE];
 		int res;
 		unsigned long bytes = SQUASHFS_METADATA_SIZE;
+		enum {Src, Dst};
+		struct sized_buf sbuf[] = {
+			{.buf = (void *)buffer},
+			{.buf = (void *)block, .sz = bytes}
+		};
 
 		c_byte = SQUASHFS_COMPRESSED_SIZE(c_byte);
 		if(read_bytes(start + offset, c_byte, buffer) == FALSE)
 			goto failed;
 
-		if((res = uncompress((unsigned char *) block, &bytes,
-		(const unsigned char *) buffer, c_byte)) != Z_OK) {
-			if(res == Z_MEM_ERROR)
-				ERROR("zlib::uncompress failed, not enough memory\n");
-			else if(res == Z_BUF_ERROR)
-				ERROR("zlib::uncompress failed, not enough room in output buffer\n");
-			else
-				ERROR("zlib::uncompress failed, unknown error %d\n", res);
-			goto failed;
-		}
+		sbuf[Src].sz = c_byte;
+		res = sqlzma_un(&un, sbuf + Src, sbuf + Dst);
+		if (res)
+			abort();
+		bytes = un.un_reslen;
 		if(next)
 			*next = start + offset + c_byte;
 		return bytes;
@@ -359,20 +366,19 @@ int read_data_block(long long start, unsigned int size, char *block)
 	TRACE("read_data_block: block @0x%llx, %d %s bytes\n", start, SQUASHFS_COMPRESSED_SIZE_BLOCK(c_byte), SQUASHFS_COMPRESSED_BLOCK(c_byte) ? "compressed" : "uncompressed");
 
 	if(SQUASHFS_COMPRESSED_BLOCK(size)) {
+		enum {Src, Dst};
+		struct sized_buf sbuf[] = {
+			{.buf = (void *)data, .sz = c_byte},
+			{.buf = (void *)block, .sz = bytes}
+		};
+
 		if(read_bytes(start, c_byte, data) == FALSE)
 			return 0;
 
-		if((res = uncompress((unsigned char *) block, &bytes,
-		(const unsigned char *) data, c_byte)) != Z_OK) {
-			if(res == Z_MEM_ERROR)
-				ERROR("zlib::uncompress failed, not enough memory\n");
-			else if(res == Z_BUF_ERROR)
-				ERROR("zlib::uncompress failed, not enough room in output buffer\n");
-			else
-				ERROR("zlib::uncompress failed, unknown error %d\n", res);
-			return 0;
-		}
-
+		res = sqlzma_un(&un, sbuf + Src, sbuf + Dst);
+		if (res)
+			abort();
+		bytes = un.un_reslen;
 		return bytes;
 	} else {
 		if(read_bytes(start, c_byte, block) == FALSE)
@@ -383,7 +389,7 @@ int read_data_block(long long start, unsigned int size, char *block)
 }
 
 
-void read_block_list(unsigned int *block_list, unsigned char *block_ptr, int blocks)
+void read_block_list(unsigned int *block_list, char *block_ptr, int blocks)
 {
 	if(swap) {
 		unsigned int sblock_list[blocks];
@@ -394,7 +400,7 @@ void read_block_list(unsigned int *block_list, unsigned char *block_ptr, int blo
 }
 
 
-void read_block_list_1(unsigned int *block_list, unsigned char *block_ptr, int blocks)
+void read_block_list_1(unsigned int *block_list, char *block_ptr, int blocks)
 {
 	unsigned short block_size;
 	int i;
@@ -638,7 +644,7 @@ failure:
 
 	
 int write_file(long long file_size, char *pathname, unsigned int fragment, unsigned int frag_bytes,
-unsigned int offset, unsigned int blocks, long long start, char *block_ptr,
+unsigned int offset, int blocks, long long start, char *block_ptr,
 unsigned int mode)
 {
 	unsigned int file_fd, bytes, i;
@@ -694,8 +700,15 @@ unsigned int mode)
 
 	if(hole) {
 		/* corner case for hole extending to end of file */
-		hole --;
-		if(write_block(file_fd, "\0", 1) == FALSE) {
+		if(lseek(file_fd, hole, SEEK_CUR) == -1) {
+			/* for broken lseeks which cannot seek beyond end of
+ 			 * file, write_block will do the right thing */
+			hole --;
+			if(write_block(file_fd, "\0", 1) == FALSE) {
+				ERROR("write_file: failed to write sparse data block\n");
+				goto failure;
+			}
+		} else if(ftruncate(file_fd, file_size) == -1) {
 			ERROR("write_file: failed to write sparse data block\n");
 			goto failure;
 		}
@@ -716,7 +729,7 @@ static struct inode *read_inode(unsigned int start_block, unsigned int offset)
 {
 	static squashfs_inode_header header;
 	long long start = sBlk.inode_table_start + start_block;
-	int bytes = lookup_entry(inode_table_hash, start), file_fd;
+	int bytes = lookup_entry(inode_table_hash, start);
 	char *block_ptr = inode_table + bytes + offset;
 	static struct inode i;
 
@@ -921,7 +934,7 @@ int create_inode(char *pathname, struct inode *i)
 				set_attributes(pathname, i->mode, i->uid, i->gid, i->time, TRUE);
 				dev_count ++;
 			} else
-				ERROR("create_inode: could not create %s device %s, because you're not superuser!\n",
+				ERROR("create_inode: could not create %s device %s, because you're not superuser! %s\n",
 					chrdev ? "character" : "block", pathname, strerror(errno));
 			break;
 		}
@@ -958,7 +971,7 @@ struct inode *read_inode_2(unsigned int start_block, unsigned int offset)
 {
 	static squashfs_inode_header_2 header;
 	long long start = sBlk.inode_table_start + start_block;
-	int bytes = lookup_entry(inode_table_hash, start), file_fd;
+	int bytes = lookup_entry(inode_table_hash, start);
 	char *block_ptr = inode_table + bytes + offset;
 	static struct inode i;
 	static int inode_number = 1;
@@ -1084,7 +1097,7 @@ struct inode *read_inode_1(unsigned int start_block, unsigned int offset)
 {
 	static squashfs_inode_header_1 header;
 	long long start = sBlk.inode_table_start + start_block;
-	int bytes = lookup_entry(inode_table_hash, start), file_fd;
+	int bytes = lookup_entry(inode_table_hash, start);
 	char *block_ptr = inode_table + bytes + offset;
 	static struct inode i;
 	static int inode_number = 1;
@@ -1775,19 +1788,27 @@ int read_super(char *source)
 	read_bytes(SQUASHFS_START, sizeof(squashfs_super_block), (char *) &sBlk);
 
 	/* Check it is a SQUASHFS superblock */
+	un.un_lzma = 1;
 	swap = 0;
-	if(sBlk.s_magic != SQUASHFS_MAGIC) {
-		if(sBlk.s_magic == SQUASHFS_MAGIC_SWAP) {
-			squashfs_super_block sblk;
-			ERROR("Reading a different endian SQUASHFS filesystem on %s\n", source);
-			SQUASHFS_SWAP_SUPER_BLOCK(&sblk, &sBlk);
-			memcpy(&sBlk, &sblk, sizeof(squashfs_super_block));
-			swap = 1;
-		} else  {
-			ERROR("Can't find a SQUASHFS superblock on %s\n", source);
-			goto failed_mount;
-		}
-	}
+	switch (sBlk.s_magic) {
+		squashfs_super_block sblk;
+	case SQUASHFS_MAGIC:
+		un.un_lzma = 0;
+		/*FALLTHROUGH*/
+	case SQUASHFS_MAGIC_LZMA:
+		break;
+	case SQUASHFS_MAGIC_SWAP:
+		un.un_lzma = 0;
+		/*FALLTHROUGH*/
+	case SQUASHFS_MAGIC_LZMA_SWAP:
+		ERROR("Reading a different endian SQUASHFS filesystem on %s\n", source);
+		SQUASHFS_SWAP_SUPER_BLOCK(&sblk, &sBlk);
+		memcpy(&sBlk, &sblk, sizeof(squashfs_super_block));
+		swap = 1;
+	default:
+		ERROR("Can't find a SQUASHFS superblock on %s\n", source);
+		goto failed_mount;
+ 	}
 
 	/* Check the MAJOR & MINOR versions */
 	if(sBlk.s_major == 1 || sBlk.s_major == 2) {
@@ -1848,7 +1869,7 @@ struct pathname *process_extract_files(struct pathname *path, char *filename)
 		
 
 #define VERSION() \
-	printf("unsquashfs version 1.5 (2007/10/31)\n");\
+	printf("unsquashfs version 1.5-CVS (2007/01/25)\n");\
 	printf("copyright (C) 2007 Phillip Lougher <phillip@lougher.demon.co.uk>\n\n"); \
     	printf("This program is free software; you can redistribute it and/or\n");\
 	printf("modify it under the terms of the GNU General Public License\n");\
@@ -1857,13 +1878,13 @@ struct pathname *process_extract_files(struct pathname *path, char *filename)
 	printf("This program is distributed in the hope that it will be useful,\n");\
 	printf("but WITHOUT ANY WARRANTY; without even the implied warranty of\n");\
 	printf("MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the\n");\
-	printf("GNU General Public License for more details.\n");
+	printf("GNU General Public License for more details.\n");\
+	printf("and LZMA support for slax.org by jro.\n");
 int main(int argc, char *argv[])
 {
 	char *dest = "squashfs-root";
 	int i, stat_sys = FALSE, version = FALSE;
-	char **target_name = NULL;
-	int n, targets = 0;
+	int n;
 	struct pathnames *paths = NULL;
 	struct pathname *path = NULL;
 
@@ -1957,6 +1978,11 @@ options:
 		EXIT_UNSQUASH("failed to allocate created_inode\n");
 
 	memset(created_inode, 0, sBlk.inodes * sizeof(char *));
+	i = sqlzma_init(&un, un.un_lzma, 0);
+	if (i != Z_OK) {
+		fputs("sqlzma_init failed", stderr);
+		abort();
+	}
 
 	read_uids_guids();
 

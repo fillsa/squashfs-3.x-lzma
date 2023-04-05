@@ -32,6 +32,7 @@
 #include <zlib.h>
 #include <sys/mman.h>
 #include <utime.h>
+#include <sys/sysmacros.h>
 
 #ifndef linux
 #define __BYTE_ORDER BYTE_ORDER
@@ -44,6 +45,8 @@
 #include <squashfs_fs.h>
 #include "read_fs.h"
 #include "global.h"
+#include "sqlzma.h"
+#include "sqmagic.h"
 
 #include <stdlib.h>
 
@@ -84,6 +87,7 @@ unsigned int block_size;
 int lsonly = FALSE, info = FALSE, force = FALSE;
 char **created_inode;
 int root_process;
+struct sqlzma_un un;
 
 #define CALCULATE_HASH(start)	(start & 0xffff)
 
@@ -163,21 +167,21 @@ squashfs_super_block *sBlk)
 		char buffer[SQUASHFS_METADATA_SIZE];
 		int res;
 		unsigned long bytes = SQUASHFS_METADATA_SIZE;
+		enum {Src, Dst};
+		struct sized_buf sbuf[] = {
+			{.buf = (void *)buffer},
+			{.buf = (void *)block, .sz = bytes}
+		};
 
 		c_byte = SQUASHFS_COMPRESSED_SIZE(c_byte);
 		if(read_bytes(start + offset, c_byte, buffer) == FALSE)
 			goto failed;
 
-		if((res = uncompress((unsigned char *) block, &bytes,
-		(const unsigned char *) buffer, c_byte)) != Z_OK) {
-			if(res == Z_MEM_ERROR)
-				ERROR("zlib::uncompress failed, not enough memory\n");
-			else if(res == Z_BUF_ERROR)
-				ERROR("zlib::uncompress failed, not enough room in output buffer\n");
-			else
-				ERROR("zlib::uncompress failed, unknown error %d\n", res);
-			goto failed;
-		}
+		sbuf[Src].sz = c_byte;
+		res = sqlzma_un(&un, sbuf + Src, sbuf + Dst);
+		if (res)
+			abort();
+		bytes = un.un_reslen;
 		if(next)
 			*next = start + offset + c_byte;
 		return bytes;
@@ -204,19 +208,19 @@ int read_data_block(long long start, unsigned int size, char *block)
 	TRACE("read_data_block: block @0x%llx, %d %s bytes\n", start, SQUASHFS_COMPRESSED_SIZE_BLOCK(c_byte), SQUASHFS_COMPRESSED_BLOCK(c_byte) ? "compressed" : "uncompressed");
 
 	if(SQUASHFS_COMPRESSED_BLOCK(size)) {
+		enum {Src, Dst};
+		struct sized_buf sbuf[] = {
+			{.buf = (void *)data, .sz = c_byte},
+			{.buf = (void *)block, .sz = bytes}
+		};
+
 		if(read_bytes(start, c_byte, data) == FALSE)
 			return 0;
 
-		if((res = uncompress((unsigned char *) block, &bytes,
-		(const unsigned char *) data, c_byte)) != Z_OK) {
-			if(res == Z_MEM_ERROR)
-				ERROR("zlib::uncompress failed, not enough memory\n");
-			else if(res == Z_BUF_ERROR)
-				ERROR("zlib::uncompress failed, not enough room in output buffer\n");
-			else
-				ERROR("zlib::uncompress failed, unknown error %d\n", res);
-			return 0;
-		}
+		res = sqlzma_un(&un, sbuf + Src, sbuf + Dst);
+		if (res)
+			abort();
+		bytes = un.un_reslen;
 
 		return bytes;
 	} else {
@@ -593,7 +597,7 @@ squashfs_super_block *sBlk)
 				set_attributes(pathname, inodep->mode, inodep->uid, inodep->guid, inodep->mtime, TRUE);
 				dev_count ++;
 			} else
-				ERROR("create_inode: could not create %s device %s, because you're not superuser!\n",
+				ERROR("create_inode: could not create %s device %s, because you're not superuser! %s\n",
 					inodep->inode_type == SQUASHFS_CHRDEV_TYPE ? "character" : "block",
 					pathname, strerror(errno));
 			break;
@@ -864,6 +868,7 @@ squashfs_super_block *sBlk, char *target)
 
 		if(lsonly || info)
 			printf("%s\n", pathname);
+			/* printf("i%d ", inode->inode_number); */
 
 		if(type == SQUASHFS_DIR_TYPE)
 			dir_scan(pathname, start_block, offset, sBlk, target);
@@ -886,19 +891,27 @@ int read_super(squashfs_super_block *sBlk, char *source)
 	read_bytes(SQUASHFS_START, sizeof(squashfs_super_block), (char *) sBlk);
 
 	/* Check it is a SQUASHFS superblock */
+	un.un_lzma = 1;
 	swap = 0;
-	if(sBlk->s_magic != SQUASHFS_MAGIC) {
-		if(sBlk->s_magic == SQUASHFS_MAGIC_SWAP) {
-			squashfs_super_block sblk;
-			ERROR("Reading a different endian SQUASHFS filesystem on %s\n", source);
-			SQUASHFS_SWAP_SUPER_BLOCK(&sblk, sBlk);
-			memcpy(sBlk, &sblk, sizeof(squashfs_super_block));
-			swap = 1;
-		} else  {
-			ERROR("Can't find a SQUASHFS superblock on %s\n", source);
-			goto failed_mount;
-		}
-	}
+	switch (sBlk->s_magic) {
+		squashfs_super_block sblk;
+	case SQUASHFS_MAGIC:
+		un.un_lzma = 0;
+		/*FALLTHROUGH*/
+	case SQUASHFS_MAGIC_LZMA:
+		break;
+	case SQUASHFS_MAGIC_SWAP:
+		un.un_lzma = 0;
+		/*FALLTHROUGH*/
+	case SQUASHFS_MAGIC_LZMA_SWAP:
+		ERROR("Reading a different endian SQUASHFS filesystem on %s\n", source);
+		SQUASHFS_SWAP_SUPER_BLOCK(&sblk, &sBlk);
+		memcpy(sBlk, &sblk, sizeof(squashfs_super_block));
+		swap = 1;
+	default:
+		ERROR("Can't find a SQUASHFS superblock on %s\n", source);
+		goto failed_mount;
+ 	}
 
 	/* Check the MAJOR & MINOR versions */
 	if(sBlk->s_major != SQUASHFS_MAJOR || sBlk->s_minor > SQUASHFS_MINOR) {
@@ -949,7 +962,8 @@ failed_mount:
 	printf("This program is distributed in the hope that it will be useful,\n");\
 	printf("but WITHOUT ANY WARRANTY; without even the implied warranty of\n");\
 	printf("MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the\n");\
-	printf("GNU General Public License for more details.\n");
+	printf("GNU General Public License for more details.\n");\
+	printf("and LZMA support for slax.org by jro.\n");
 int main(int argc, char *argv[])
 {
 	squashfs_super_block sBlk;
@@ -1016,6 +1030,11 @@ options:
 		EXIT_UNSQUASH("failed to allocate created_inode\n");
 
 	memset(created_inode, 0, sBlk.inodes * sizeof(char *));
+	i = sqlzma_init(&un, un.un_lzma, 0);
+	if (i != Z_OK) {
+		fputs("sqlzma_init failed", stderr);
+		abort();
+	}
 
 	read_uids_guids(&sBlk);
 	read_fragment_table(&sBlk);

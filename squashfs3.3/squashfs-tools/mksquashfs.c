@@ -46,6 +46,7 @@
 #include <math.h>
 #include <regex.h>
 #include <fnmatch.h>
+#include <sys/sysmacros.h>
 
 #ifndef linux
 #define __BYTE_ORDER BYTE_ORDER
@@ -61,6 +62,8 @@
 #include "mksquashfs.h"
 #include "global.h"
 #include "sort.h"
+#include "sqlzma.h"
+#include "sqmagic.h"
 
 #ifdef SQUASHFS_TRACE
 #define TRACE(s, args...)	do { \
@@ -112,6 +115,11 @@ unsigned short uid_count = 0, guid_count = 0;
 squashfs_uid uids[SQUASHFS_UIDS], guids[SQUASHFS_GUIDS];
 int block_offset;
 int file_count = 0, sym_count = 0, dev_count = 0, dir_count = 0, fifo_count = 0, sock_count = 0;
+struct sqlzma_un un;
+struct sqlzma_opts sqlzma_opts = {
+	.try_lzma	= 1,
+	.dicsize	= SQUASHFS_FILE_SIZE
+};
 
 /* write position within data section */
 long long bytes = 0, total_bytes = 0;
@@ -626,21 +634,9 @@ unsigned int mangle2(z_stream **strm, char *d, char *s, int size, int block_size
 			BAD_ERROR("zlib::compress failed, unknown error %d\n", res);
 	}
 
-	stream->next_in = (unsigned char *) s;
-	stream->avail_in = size;
-	stream->next_out = (unsigned char *) d;
-	stream->avail_out = block_size;
-
-	res = deflate(stream, Z_FINISH);
-	if(res != Z_STREAM_END && res != Z_OK) {
-		if(res == Z_STREAM_ERROR)
-			BAD_ERROR("zlib::compress failed, stream state inconsistent\n");
-		else if(res == Z_BUF_ERROR)
-			BAD_ERROR("zlib::compress failed, no progress possible\n");
-		else
-			BAD_ERROR("zlib::compress failed, unknown error %d\n", res);
-	}
-
+//	res = sqlzma_cm(un.un_lzma, stream, s, size, d, block_size);
+	res = sqlzma_cm(&sqlzma_opts, stream, (void *)s, size, (void *)d,
+			block_size);
 	c_byte = stream->total_out;
 
 	if(res != Z_STREAM_END || c_byte >= size) {
@@ -739,6 +735,7 @@ void write_bytes(int fd, long long byte, int bytes, char *buff)
 		EXIT_MKSQUASHFS();
 	}
 
+	//printf("%d bytes at %Ld\n", bytes, off);
 	if(write(fd, buff, bytes) == -1) {
 		perror("Write on destination failed");
 		EXIT_MKSQUASHFS();
@@ -891,7 +888,7 @@ int create_inode(squashfs_inode *i_no, struct dir_ent *dir_ent, int type, long l
 			SQUASHFS_SWAP_REG_INODE_HEADER(reg, inodep);
 			SQUASHFS_SWAP_INTS(block_list, inodep->block_list, offset);
 		}
-		TRACE("File inode, file_size %d, start_block %llx, blocks %d, fragment %d, offset %d, size %d\n", (int) byte_size,
+		TRACE("File inode, file_size %lld, start_block 0x%llx, blocks %d, fragment %d, offset %d, size %d\n", byte_size,
 			start_block, offset, fragment->index, fragment->offset, fragment->size);
 		for(i = 0; i < offset; i++)
 			TRACE("Block %d, size %d\n", i, block_list[i]);
@@ -953,7 +950,7 @@ int create_inode(squashfs_inode *i_no, struct dir_ent *dir_ent, int type, long l
 			memcpy(((squashfs_dir_index *)p)->name, index[i].name, index[i].index.size + 1);
 			p += sizeof(squashfs_dir_index) + index[i].index.size + 1;
 		}
-		TRACE("Long directory inode, file_size %d, start_block %llx, offset %x, nlink %d\n", (int) byte_size,
+		TRACE("Long directory inode, file_size %lld, start_block %llx, offset 0x%x, nlink %d\n", byte_size,
 			start_block, offset, dir_ent->dir->directory_count + 2);
 	}
 	else if(type == SQUASHFS_DIR_TYPE) {
@@ -969,7 +966,7 @@ int create_inode(squashfs_inode *i_no, struct dir_ent *dir_ent, int type, long l
 			memcpy(inode, dir, sizeof(*dir));
 		else
 			SQUASHFS_SWAP_DIR_INODE_HEADER(dir, inode);
-		TRACE("Directory inode, file_size %d, start_block %llx, offset %x, nlink %d\n", (int) byte_size,
+		TRACE("Directory inode, file_size %lld, start_block %llx, offset 0x%x, nlink %d\n", byte_size,
 			start_block, offset, dir_ent->dir->directory_count + 2);
 	}
 	else if(type == SQUASHFS_CHRDEV_TYPE || type == SQUASHFS_BLKDEV_TYPE) {
@@ -991,12 +988,12 @@ int create_inode(squashfs_inode *i_no, struct dir_ent *dir_ent, int type, long l
 		char buff[65536];
 
 		if((byte = readlink(filename, buff, 65536)) == -1) {
-			ERROR("Failed to read symlink %d, creating empty symlink\n", filename);
+			ERROR("Failed to read symlink %s, creating empty symlink\n", filename);
 			byte = 0;
 		}
 
 		if(byte == 65536) {
-			ERROR("Symlink %d is greater than 65536 bytes! Creating empty symlink\n", filename);
+			ERROR("Symlink %s is greater than 65536 bytes! Creating empty symlink\n", filename);
 			byte = 0;
 		}
 
@@ -1022,7 +1019,7 @@ int create_inode(squashfs_inode *i_no, struct dir_ent *dir_ent, int type, long l
 			SQUASHFS_SWAP_IPC_INODE_HEADER(ipc, inode);
 		TRACE("ipc inode, type %s, nlink %d\n", type == SQUASHFS_FIFO_TYPE ? "fifo" : "socket", nlink);
 	} else
-		BAD_ERROR("Unrecognised inode %d in create_inode\n");
+		BAD_ERROR("Unrecognised inode %d in create_inode\n", type);
 
 	*i_no = MKINODE(inode);
 	inode_count ++;
@@ -1250,17 +1247,17 @@ char *get_fragment(char *buffer, struct fragment *fragment, int *cached_fragment
 		int res;
 		unsigned long bytes = block_size;
 		char cbuffer[block_size];
+		enum {Src, Dst};
+		struct sized_buf sbuf[] = {
+			{.buf = (void *)cbuffer, .sz = size},
+			{.buf = (void *)buffer, .sz = bytes}
+		};
 
 		read_bytes(fd, disk_fragment->start_block, size, cbuffer);
 
-		if((res = uncompress((unsigned char *) buffer, &bytes, (const unsigned char *) cbuffer, size)) != Z_OK) {
-			if(res == Z_MEM_ERROR)
-				BAD_ERROR("zlib::uncompress failed, not enough memory\n");
-			else if(res == Z_BUF_ERROR)
-				BAD_ERROR("zlib::uncompress failed, not enough room in output buffer\n");
-			else
-				BAD_ERROR("zlib::uncompress failed, unknown error %d\n", res);
-		}
+		res = sqlzma_un(&un, sbuf + Src, sbuf + Dst);
+		if (res)
+			BAD_ERROR("%s:%d: res %d\n", __func__, __LINE__, res);
 	} else
 		read_bytes(fd, disk_fragment->start_block, size, buffer);
 
@@ -1341,7 +1338,7 @@ long long generic_write_table(int length, char *buffer, int uncompressed)
 {
 	int meta_blocks = (length + SQUASHFS_METADATA_SIZE - 1) / SQUASHFS_METADATA_SIZE;
 	long long list[meta_blocks], start_bytes;
-	int avail_bytes, compressed_size, i;
+	int compressed_size, i;
 	unsigned short c_byte;
 	char cbuffer[(SQUASHFS_METADATA_SIZE << 2) + 2];
 	
@@ -1480,7 +1477,6 @@ char fragdata[SQUASHFS_FILE_MAX_SIZE];
 void add_file(long long start, long long file_size, long long file_bytes, unsigned int *block_listp, int blocks, unsigned int fragment, int offset, int bytes)
 {
 	struct fragment *frg;
-	char *datap;
 	unsigned int *block_list = block_listp;
 	struct file_info *dupl_ptr = dupl[DUP_HASH(file_size)];
 
@@ -1579,7 +1575,7 @@ struct file_info *duplicate(long long file_size, long long bytes, unsigned int *
 			char *buffer;
 			int block;
 
-			if(memcmp(*block_list, dupl_ptr->block_list, blocks) != 0)
+			if(memcmp(*block_list, dupl_ptr->block_list, blocks * sizeof(unsigned int)) != 0)
 				continue;
 
 			if(checksum_flag == FALSE) {
@@ -1734,6 +1730,7 @@ void reader_scan(struct dir_info *dir) {
 				break;
 		}
 	}
+	return NULL;
 }
 
 
@@ -1784,6 +1781,7 @@ void *writer(void *arg)
 			write_error = TRUE;
 		}
 
+		//printf("%d bytes at %Ld\n", file_buffer->size, off);
 		if(!write_error && write(fd, file_buffer->data, file_buffer->size) == -1) {
 			perror("Write on destination failed");
 			write_error = TRUE;
@@ -1866,7 +1864,7 @@ void *frag_deflator(void *arg)
 		bytes += compressed_size;
 		total_uncompressed += file_buffer->size;
 		total_compressed += compressed_size;
-		TRACE("Writing fragment %d, uncompressed size %d, compressed size %d\n", file_buffer->block, file_buffer->size, compressed_size);
+		TRACE("Writing fragment %lld, uncompressed size %d, compressed size %d\n", file_buffer->block, file_buffer->size, compressed_size);
 		fragments_outstanding --;
 		pthread_cond_signal(&fragment_waiting);
 		pthread_mutex_unlock(&fragment_mutex);
@@ -1926,7 +1924,7 @@ int progress_bar(long long current, long long max, int columns)
 	int spaces = columns - used - hashes;
 
 	if(!progress || columns - used < 0)
-		return;
+		return 0;
 
 	printf("\r[");
 
@@ -1939,6 +1937,7 @@ int progress_bar(long long current, long long max, int columns)
 	printf("] %*lld/%*lld", max_digits, current, max_digits, max);
 	printf(" %3lld%%", current * 100 / max);
 	fflush(stdout);
+	return 0;
 }
 
 
@@ -1955,7 +1954,6 @@ void write_file_empty(squashfs_inode *inode, struct dir_ent *dir_ent, int *dupli
 
 void write_file_frag_dup(squashfs_inode *inode, struct dir_ent *dir_ent, int size, int *duplicate_file, struct file_buffer *file_buffer, unsigned short checksum)
 {
-	int file;
 	struct file_info *dupl_ptr;
 	struct fragment *fragment;
 	unsigned int *block_listp = NULL;
@@ -2022,10 +2020,9 @@ void write_file_frag(squashfs_inode *inode, struct dir_ent *dir_ent, int size, s
 int write_file_blocks(squashfs_inode *inode, struct dir_ent *dir_ent, long long read_size, struct file_buffer *reader_buffer, int *duplicate_file)
 {
 	int block;
-	unsigned int c_byte, frag_bytes;
-	long long bbytes, file_bytes, start;
+	unsigned int frag_bytes;
+	long long file_bytes, start;
 	struct fragment *fragment;
-	struct file_info *dupl_ptr;
 	int blocks = (read_size + block_size - 1) >> block_log;
 	unsigned int *block_list;
 	struct file_buffer *read_buffer;
@@ -2113,14 +2110,13 @@ read_err:
 int write_file_blocks_dup(squashfs_inode *inode, struct dir_ent *dir_ent, long long read_size, struct file_buffer *reader_buffer, int *duplicate_file)
 {
 	int block, thresh;
-	unsigned int c_byte, frag_bytes;
-	long long bbytes, file_bytes, start;
+	unsigned int frag_bytes;
+	long long file_bytes, start;
 	struct fragment *fragment;
 	struct file_info *dupl_ptr;
 	int blocks = (read_size + block_size - 1) >> block_log;
 	unsigned int *block_list, *block_listp;
 	struct file_buffer *read_buffer;
-	struct file_data *file_data;
 	struct buffer_list *buffer_list;
 	int status;
 
@@ -2153,6 +2149,8 @@ int write_file_blocks_dup(squashfs_inode *inode, struct dir_ent *dir_ent, long l
 		}
 
 		block_list[block] = read_buffer->c_byte;
+		buffer_list[block].start = bytes;
+		buffer_list[block].size = read_buffer->size;
 
 		if(read_buffer->c_byte) {
 			read_buffer->block = bytes;
@@ -2167,8 +2165,6 @@ int write_file_blocks_dup(squashfs_inode *inode, struct dir_ent *dir_ent, long l
 			buffer_list[block].read_buffer = NULL;
 			alloc_free(read_buffer);
 		}
-		buffer_list[block].start = read_buffer->block;
-		buffer_list[block].size = read_buffer->size;
 		progress_bar(++cur_uncompressed, estimated_uncompressed, columns);
 	}
 
@@ -2188,7 +2184,8 @@ int write_file_blocks_dup(squashfs_inode *inode, struct dir_ent *dir_ent, long l
 	if(dupl_ptr) {
 		*duplicate_file = FALSE;
 		for(block = thresh; block < blocks; block ++)
-			queue_put(to_writer, buffer_list[block].read_buffer);
+			if(buffer_list[block].read_buffer)
+				queue_put(to_writer, buffer_list[block].read_buffer);
 		fragment = get_and_fill_fragment(read_buffer);
 		dupl_ptr->fragment = fragment;
 	} else {
@@ -2340,6 +2337,10 @@ struct inode_info *lookup_inode(struct stat *buf)
 	inode->read = FALSE;
 	inode->inode = SQUASHFS_INVALID_BLK;
 	inode->nlink = 1;
+
+	if((buf->st_mode & S_IFMT) == S_IFREG)
+		estimated_uncompressed += (buf->st_size + block_size - 1) >> block_log;
+
 	if((buf->st_mode & S_IFMT) == S_IFDIR)
 		inode->inode_number = dir_inode_no ++;
 	else
@@ -2393,8 +2394,6 @@ void sort_directory(struct dir_info *dir)
 
 struct dir_info *scan1_opendir(char *pathname)
 {
-	DIR	*linuxdir;
-	struct dirent *d_name;
 	struct dir_info *dir;
 
 	if((dir = malloc(sizeof(struct dir_info))) == NULL)
@@ -2613,9 +2612,6 @@ struct dir_info *dir_scan1(char *pathname, struct pathnames *paths, int (_readdi
 				continue;
 		}
 
-		if((buf.st_mode & S_IFMT) == S_IFREG)
-			estimated_uncompressed += (buf.st_size + block_size - 1) >> block_log;
-
 		if((buf.st_mode & S_IFMT) == S_IFDIR) {
 			if((sub_dir = dir_scan1(filename, new, scan1_readdir)) == NULL)
 				continue;
@@ -2635,7 +2631,7 @@ error:
 
 void dir_scan2(squashfs_inode *inode, struct dir_info *dir_info)
 {
-	int squashfs_type;
+	int squashfs_type = -1;
 	int duplicate_file;
 	char *pathname = dir_info->pathname;
 	struct directory dir;
@@ -2698,10 +2694,9 @@ void dir_scan2(squashfs_inode *inode, struct dir_info *dir_info)
 					sock_count ++;
 					break;
 
-#if 0
+#if 1
 			 	default:
-					ERROR("%s unrecognised file type, mode is %x\n", filename, buf->st_mode);
-					result = FALSE;
+					BAD_ERROR("%s unrecognised file type, mode is %x\n", filename, buf->st_mode);
 #endif
 			}
 			dir_ent->inode->inode = *inode;
@@ -2886,7 +2881,6 @@ void initialise_threads()
 long long write_inode_lookup_table()
 {
 	int i, inode_number, lookup_bytes = SQUASHFS_LOOKUP_BYTES(inode_count);
-	char cbuffer[(SQUASHFS_METADATA_SIZE << 2) + 2];
 
 	if(inode_count == sinode_count)
 		goto skip_inode_hash_table;
@@ -2918,7 +2912,7 @@ skip_inode_hash_table:
 char *get_component(char *target, char *targname)
 {
 	while(*target == '/')
-		*target ++;
+		target ++;
 
 	while(*target != '/' && *target!= '\0')
 		*targname ++ = *target ++;
@@ -3233,7 +3227,7 @@ void read_recovery_data(char *recovery_file, char *destination_file)
 
 
 #define VERSION() \
-	printf("mksquashfs version 3.3 (2007/10/31)\n");\
+	printf("mksquashfs version 3.3-CVS (2007/12/04)\n");\
 	printf("copyright (C) 2007 Phillip Lougher <phillip@lougher.demon.co.uk>\n\n"); \
     	printf("This program is free software; you can redistribute it and/or\n");\
 	printf("modify it under the terms of the GNU General Public License\n");\
@@ -3242,7 +3236,8 @@ void read_recovery_data(char *recovery_file, char *destination_file)
 	printf("This program is distributed in the hope that it will be useful,\n");\
 	printf("but WITHOUT ANY WARRANTY; without even the implied warranty of\n");\
 	printf("MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the\n");\
-	printf("GNU General Public License for more details.\n");
+	printf("GNU General Public License for more details.\n");\
+	printf("and LZMA support for slax.org by jro.\n");
 int main(int argc, char *argv[])
 {
 	struct winsize winsize;
@@ -3261,6 +3256,7 @@ int main(int argc, char *argv[])
 	be = FALSE;
 #endif
 
+	un.un_lzma = 1;
 	block_log = slog(block_size);
 	if(argc > 1 && strcmp(argv[1], "-version") == 0) {
 		VERSION();
@@ -3319,24 +3315,33 @@ int main(int argc, char *argv[])
 				ERROR("%s: -write-queue should be 1 megabyte or larger\n", argv[0]);
 				exit(1);
 			}
-		} else if(strcmp(argv[i], "-b") == 0) {
+		} else if(strcmp(argv[i], "-b") == 0
+			|| strcmp(argv[i], "-lzmadic") == 0) {
+			long bs;
+			unsigned int bl;
 			if(++i == argc) {
-				ERROR("%s: -b missing block size\n", argv[0]);
+				ERROR("%s: -b|-lzmadic missing block size\n", argv[0]);
 				exit(1);
 			}
-			block_size = strtol(argv[i], &b, 10);
+			bs = strtol(argv[i], &b, 10);
 			if(*b == 'm' || *b == 'M')
-				block_size *= 1048576;
+				bs *= 1048576;
 			else if(*b == 'k' || *b == 'K')
-				block_size *= 1024;
+				bs *= 1024;
 			else if(*b != '\0') {
-				ERROR("%s: -b invalid block size\n", argv[0]);
+				ERROR("%s: -b|-lzmadic invalid size\n", argv[0]);
 				exit(1);
 			}
-			if((block_log = slog(block_size)) == 0) {
-				ERROR("%s: -b block size not power of two or not between 4096 and 1Mbyte\n", argv[0]);
+			bl = slog(bs);
+			if(bl == 0) {
+				ERROR("%s: -b|-lzmadic size not power of two or not between 4096 and 1Mbyte\n", argv[0]);
 				exit(1);
 			}
+			if (!strcmp(argv[i - 1], "-b")) {
+				block_size = bs;
+				block_log = bl;
+			}
+			sqlzma_opts.dicsize = bs;
 		} else if(strcmp(argv[i], "-ef") == 0) {
 			if(++i == argc) {
 				ERROR("%s: -ef missing filename\n", argv[0]);
@@ -3440,6 +3445,9 @@ int main(int argc, char *argv[])
 				exit(1);
 			}	
 			root_name = argv[i];
+		} else if(strcmp(argv[i], "-nolzma") == 0) {
+			un.un_lzma = 0;
+			sqlzma_opts.try_lzma = 0;
 		} else if(strcmp(argv[i], "-version") == 0) {
 			VERSION();
 		} else {
@@ -3489,6 +3497,12 @@ printOptions:
 			ERROR("-ef <exclude_file>\tlist of exclude dirs/files.  One per line\n");
 			ERROR("-wildcards\t\tAllow extended shell wildcards (globbing) to be used in\n\t\t\texclude dirs/files\n");
 			ERROR("-regex\t\t\tAllow POSIX regular expressions to be used in exclude\n\t\t\tdirs/files\n");
+			ERROR("-lzmadic <dic_size>\tset the LZMA dictionary"
+			      " size to <dic_size>\n"
+			      "\t\t\tDefault value always follow the block"
+			      " size\n"
+			      "\t\t\tUse this alone or AFTER -b option\n");
+			ERROR("-nolzma\t\t\tnever try LZMA compression\n");
 			exit(1);
 		}
 	}
@@ -3595,6 +3609,7 @@ printOptions:
 
 		be = orig_be;
 		block_log = slog(block_size = sBlk.block_size);
+		//sqlzma_opts.dicsize = block_size;
 		s_minor = sBlk.s_minor;
 		noI = SQUASHFS_UNCOMPRESSED_INODES(sBlk.flags);
 		noD = SQUASHFS_UNCOMPRESSED_DATA(sBlk.flags);
@@ -3608,10 +3623,18 @@ printOptions:
 
 	initialise_threads();
 
+	i = sqlzma_init(&un, un.un_lzma, 0);
+	if (i != Z_OK) {
+		ERROR("%s:%d: %d\n", __func__, __LINE__, i);
+		EXIT_MKSQUASHFS();
+	}
+
 	if(delete) {
 		printf("Creating %s %d.%d filesystem on %s, block size %d.\n",
 				be ? "big endian" : "little endian", SQUASHFS_MAJOR, s_minor, argv[source + 1], block_size);
 		bytes = sizeof(squashfs_super_block);
+		if (sqlzma_opts.try_lzma)
+			printf("lzmadic %u\n", sqlzma_opts.dicsize);
 	} else {
 		unsigned int last_directory_block, inode_dir_offset, inode_dir_file_size, root_inode_size,
 		inode_dir_start_block, uncompressed_data, compressed_data, inode_dir_inode_number,
@@ -3635,6 +3658,8 @@ printOptions:
 
 		printf("Appending to existing %s %d.%d filesystem on %s, block size %d\n", be ? "big endian" :
 			"little endian", SQUASHFS_MAJOR, s_minor, argv[source + 1], block_size);
+		if (sqlzma_opts.try_lzma)
+			printf("lzmadic %u\n", sqlzma_opts.dicsize);
 		printf("All -be, -le, -b, -noI, -noD, -noF, -check_data, no-duplicates, no-fragments, -always-use-fragments and -exportable options ignored\n");
 		printf("\nIf appending is not wanted, please re-run with -noappend specified!\n\n");
 
@@ -3733,7 +3758,9 @@ printOptions:
 		dir_scan(&inode, "", scan1_encomp_readdir);
 	sBlk.root_inode = inode;
 	sBlk.inodes = inode_count;
-	sBlk.s_magic = SQUASHFS_MAGIC;
+	sBlk.s_magic = SQUASHFS_MAGIC_LZMA;
+	if (!un.un_lzma)
+		sBlk.s_magic = SQUASHFS_MAGIC;
 	sBlk.s_major = SQUASHFS_MAJOR;
 	sBlk.s_minor = s_minor;
 	sBlk.block_size = block_size;
@@ -3819,6 +3846,8 @@ restore_filesystem:
 		exportable ? "Exportable " : "", be ?  "Big endian" : "Little endian", block_size,
 		noD ? "uncompressed" : "compressed", noI ?  "uncompressed" : "compressed",
 		no_fragments ? "no" : noF ? "uncompressed" : "compressed", duplicate_checking ? "" : "not ");
+	if (sqlzma_opts.try_lzma)
+		printf("lzmadic %u\n", sqlzma_opts.dicsize);
 	printf("Filesystem size %.2f Kbytes (%.2f Mbytes)\n", bytes / 1024.0, bytes / (1024.0 * 1024.0));
 	printf("\t%.2f%% of uncompressed filesystem size (%.2f Kbytes)\n",
 		((float) bytes / total_bytes) * 100.0, total_bytes / 1024.0);

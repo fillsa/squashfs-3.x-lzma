@@ -46,6 +46,8 @@ extern int add_file(long long, long long, long long, unsigned int *, int, unsign
 #include <squashfs_fs.h>
 #include "read_fs.h"
 #include "global.h"
+#include "sqlzma.h"
+#include "sqmagic.h"
 
 #include <stdlib.h>
 
@@ -62,6 +64,7 @@ extern int add_file(long long, long long, long long, unsigned int *, int, unsign
 					} while(0)
 
 int swap;
+extern struct sqlzma_un un;
 
 int read_block(int fd, long long start, long long *next, unsigned char *block, squashfs_super_block *sBlk)
 {
@@ -81,19 +84,20 @@ int read_block(int fd, long long start, long long *next, unsigned char *block, s
 		char buffer[SQUASHFS_METADATA_SIZE];
 		int res;
 		unsigned long bytes = SQUASHFS_METADATA_SIZE;
+		enum {Src, Dst};
+		struct sized_buf sbuf[] = {
+			{.buf = (void *)buffer},
+			{.buf = (void *)block, .sz = bytes}
+		};
 
 		c_byte = SQUASHFS_COMPRESSED_SIZE(c_byte);
 		read_bytes(fd, start + offset, c_byte, buffer);
 
-		if((res = uncompress(block, &bytes, (const unsigned char *) buffer, c_byte)) != Z_OK) {
-			if(res == Z_MEM_ERROR)
-				ERROR("zlib::uncompress failed, not enough memory\n");
-			else if(res == Z_BUF_ERROR)
-				ERROR("zlib::uncompress failed, not enough room in output buffer\n");
-			else
-				ERROR("zlib::uncompress failed, unknown error %d\n", res);
-			return 0;
-		}
+		sbuf[Src].sz = c_byte;
+		res = sqlzma_un(&un, sbuf + Src, sbuf + Dst);
+		if (res)
+			abort();
+		bytes = un.un_reslen;
 		if(next)
 			*next = start + offset + c_byte;
 		return bytes;
@@ -231,20 +235,20 @@ int scan_inode_table(int fd, long long start, long long end, long long root_inod
 				} else
 					memcpy(&inode, cur_ptr, sizeof(inode));
 
-				TRACE("scan_inode_table: extended regular file, file_size %lld, blocks %d\n", inode.file_size, blocks);
-
-				cur_ptr += sizeof(inode);
 				frag_bytes = inode.fragment == SQUASHFS_INVALID_FRAG ? 0 : inode.file_size % sBlk->block_size;
 				blocks = inode.fragment == SQUASHFS_INVALID_FRAG ? (inode.file_size
 					+ sBlk->block_size - 1) >> sBlk->block_log : inode.file_size >>
 					sBlk->block_log;
 				start = inode.start_block;
 
+				TRACE("scan_inode_table: extended regular file, file_size %lld, blocks %d\n", inode.file_size, blocks);
+
 				if((block_list = malloc(blocks * sizeof(unsigned int))) == NULL) {
 					ERROR("Out of memory in block list malloc\n");
 					goto failed;
 				}
 
+				cur_ptr += sizeof(inode);
 				if(swap) {
 					unsigned int sblock_list[blocks];
 					memcpy(sblock_list, cur_ptr, blocks * sizeof(unsigned int));
@@ -351,18 +355,30 @@ int read_super(int fd, squashfs_super_block *sBlk, int *be, char *source)
 
 	/* Check it is a SQUASHFS superblock */
 	swap = 0;
-	if(sBlk->s_magic != SQUASHFS_MAGIC) {
-		if(sBlk->s_magic == SQUASHFS_MAGIC_SWAP) {
-			squashfs_super_block sblk;
-			ERROR("Reading a different endian SQUASHFS filesystem on %s - ignoring -le/-be options\n", source);
-			SQUASHFS_SWAP_SUPER_BLOCK(&sblk, sBlk);
-			memcpy(sBlk, &sblk, sizeof(squashfs_super_block));
-			swap = 1;
-		} else  {
-			ERROR("Can't find a SQUASHFS superblock on %s\n", source);
-			goto failed_mount;
-		}
-	}
+	switch (sBlk->s_magic) {
+		squashfs_super_block sblk;
+
+	case SQUASHFS_MAGIC_LZMA:
+		if (!un.un_lzma)
+			goto bad;
+		break;
+	case SQUASHFS_MAGIC:
+		break;
+	case SQUASHFS_MAGIC_LZMA_SWAP:
+		if (!un.un_lzma)
+			goto bad;
+		/*FALLTHROUGH*/
+	case SQUASHFS_MAGIC_SWAP:
+		ERROR("Reading a different endian SQUASHFS filesystem on %s - ignoring -le/-be options\n", source);
+		SQUASHFS_SWAP_SUPER_BLOCK(&sblk, sBlk);
+		memcpy(sBlk, &sblk, sizeof(squashfs_super_block));
+		swap = 1;
+		break;
+	bad:
+	default:
+		ERROR("Can't find a SQUASHFS superblock on %s\n", source);
+		goto failed_mount;
+ 	}
 
 	/* Check the MAJOR & MINOR versions */
 	if(sBlk->s_major != SQUASHFS_MAJOR || sBlk->s_minor > SQUASHFS_MINOR) {
@@ -398,7 +414,7 @@ int read_super(int fd, squashfs_super_block *sBlk, int *be, char *source)
 	TRACE("sBlk->directory_table_start %llx\n", sBlk->directory_table_start);
 	TRACE("sBlk->uid_start %llx\n", sBlk->uid_start);
 	TRACE("sBlk->fragment_table_start %llx\n", sBlk->fragment_table_start);
-	TRACE("sBlk->lookup_table_start %xllx\n", sBlk->lookup_table_start);
+	TRACE("sBlk->lookup_table_start %llx\n", sBlk->lookup_table_start);
 	printf("\n");
 
 	return TRUE;
@@ -416,7 +432,7 @@ unsigned char *squashfs_readdir(int fd, int root_entries, unsigned int directory
 	squashfs_dir_entry *dire = (squashfs_dir_entry *) buffer;
 	unsigned char *directory_table = NULL;
 	int byte, bytes = 0, dir_count;
-	long long start = sBlk->directory_table_start + directory_start_block, last_start_block; 
+	long long start = sBlk->directory_table_start + directory_start_block, last_start_block = -1; 
 
 	size += offset;
 	if((directory_table = malloc((size + SQUASHFS_METADATA_SIZE * 2 - 1) & ~(SQUASHFS_METADATA_SIZE - 1))) == NULL)
